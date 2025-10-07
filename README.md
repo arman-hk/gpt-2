@@ -1,22 +1,25 @@
-# gpt-2
+<h1 align="center">gpt-2</h1>
 
-> **JAX is all you need** ❤️
+<p align="center"><b>JAX is all you need</b> 💜</p>
 
-A mini, functional implementation of GPT-2 using nothing but JAX and `jax.numpy`.
+<p align="center">
+  <em>A compact, functional implementation of gpt-2 using only <code>jax</code> and <code>jax.numpy</code></em>
+</p>
 
-- **`data.py`**
-- **`model.py`**
-- **`train.py`**
+---
+
+### Structure:
+- [`data.py`](./src/data.py)
+- [`model.py`](./src/model.py)
+- [`train.py`](./src/train.py)
 
 That's basically it.
 
-#### Ideas and phil:
-- Full transparency: every layer, every operation is explicit.
-- JAX Functional style: immutable pytrees, pure functions, and explicit state threading. (will expand on this later)
-- Education: did this project to better understand jax programming, implement gpt-2 from scratch, and code as clear, performant, compact, and readable as possible so others can also use it as an educational resource.
-Traditional PyTorch/TensorFlow code is imperative and stateful. JAX forces a different paradigm:
+### Ideas and phil:
+- JAX functional style: immutable pytrees, pure functions, and explicit state threading. (will expand on this later)
+- Education: did this project to better understand `jax` programming, implement gpt-2 from scratch, and code as clear, performant, compact, and readable as possible so others can also use it as an educational resource.
 
-#### WIP
+### WIP:
 - [ ] train with TPUs
 - [ ] optimize and experiment
-- [ ] having fun with it and seeing where this goes
+- [ ] have fun and see where this goes
