@@ -6,6 +6,9 @@ import optax
 from . import model, data as data_mod
 from functools import partial
 
+from jax import config as jax_config
+jax_config.update("jax_default_matmul_precision", "highest")
+
 # ---------- (1) configs and train state ------------
 @dataclasses.dataclass
 class TrainConfig:
@@ -33,15 +36,16 @@ class TrainConfig:
     # other configs
     gpt: model.GPTConfig = dataclasses.field(
         default_factory=lambda: model.GPTConfig(
-            vocab_size=50257, ctx_len=128, n_layer=2, n_head=2, d_model=64, dropout_rate=0.0, dtype=jnp.float32
-        )  # currently set for debug
+            vocab_size=50257, ctx_len=128, n_layer=2, n_head=2, d_model=64, dropout_rate=0.0, dtype=jnp.bfloat16
+        )  # small debug config; bf16 params for TPU
     )
     data: data_mod.DataConfig = dataclasses.field(
         default_factory=lambda: data_mod.DataConfig(batch_size=8, seq_len=128)
     )
 
 class TrainState(NamedTuple):
-    params: model.ModelParams
+    params: model.ModelParams  # bf16 params used for forward/backprop
+    master_params: model.ModelParams  # f32 master copy used by optimizer
     opt_state: Any
     step: jnp.ndarray
     rng_key: jax.Array
@@ -49,10 +53,12 @@ class TrainState(NamedTuple):
 def init_train_state(cfg: TrainConfig, key: jax.Array) -> Tuple[TrainState, Callable[..., jnp.ndarray]]:
     k_init, k_state = jax.random.split(key, 2)
     params, forward = model.build(cfg.gpt, key=k_init)
-    opt = make_optim(cfg, params)
+    master_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), params)
+    opt = make_optim(cfg, master_params)
     state = TrainState(
         params=params,
-        opt_state=opt.init(params),
+        master_params=master_params,
+        opt_state=opt.init(master_params),
         step=jnp.asarray(0, dtype=jnp.int32),
         rng_key=k_state,
     )
@@ -80,7 +86,7 @@ def make_optim(cfg: TrainConfig, params: model.ModelParams) -> optax.GradientTra
 # ---------- (3) loss and metrics ------------
 def xent_loss(logits: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
     # logits: (B,T,V), targets: (B,T) -> scalar loss
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
     return -jnp.mean(jnp.take_along_axis(log_probs, targets[..., None], axis=-1).squeeze(-1))
 
 class Metrics(NamedTuple):
@@ -92,7 +98,7 @@ def compute_metrics(logits: jnp.ndarray, targets: jnp.ndarray) -> Metrics:
     # logits: (B,T,V), targets: (B,T) -> {loss, acc, ppl}
     loss = xent_loss(logits, targets)
     preds = jnp.argmax(logits, axis=-1)  # (B,T)
-    acc = jnp.mean(preds == targets)
+    acc = jnp.mean((preds == targets).astype(jnp.float32))
     ppl = jnp.exp(loss)
     return Metrics(loss=loss, accuracy=acc, perplexity=ppl)
 
@@ -104,10 +110,10 @@ def loss_fn(params: model.ModelParams, xs: jnp.ndarray, ys: jnp.ndarray, forward
 def compile_train_step(
     cfg: TrainConfig,
     forward: Callable[..., jnp.ndarray],
-    params_example: model.ModelParams,
+    master_params_example: model.ModelParams,
 ):
     # returns a jitted single-device train step closure: (state, batch) -> new_state.
-    opt = make_optim(cfg, params_example)
+    opt = make_optim(cfg, master_params_example)
     grad_fn = jax.grad(lambda p, x, y, k: loss_fn(p, x, y, forward, k))
 
     @partial(jax.jit, donate_argnums=(0, 1))
@@ -124,12 +130,15 @@ def compile_train_step(
         # vmap grad over microbatches, broadcast params
         grads_m = jax.vmap(grad_fn, in_axes=(None, 0, 0, 0))(state.params, xs_m, ys_m, k_micro)
         grads = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_m)
+        grads_f32 = jax.tree_util.tree_map(lambda g: g.astype(jnp.float32), grads)
 
-        updates, new_opt_state = opt.update(grads, state.opt_state, state.params)
-        new_params = optax.apply_updates(state.params, updates)
+        updates, new_opt_state = opt.update(grads_f32, state.opt_state, state.master_params)
+        new_master_params = optax.apply_updates(state.master_params, updates)
+        new_params = jax.tree_util.tree_map(lambda old, new: new.astype(old.dtype), state.params, new_master_params)
 
         new_state = TrainState(
             params=new_params,
+            master_params=new_master_params,
             opt_state=new_opt_state,
             step=state.step + 1,
             rng_key=k_next,
@@ -142,7 +151,7 @@ def compile_train_step(
 def train(cfg: TrainConfig) -> None:
     key = jax.random.PRNGKey(cfg.seed)
     state, forward = init_train_state(cfg, key)
-    step = compile_train_step(cfg, forward, state.params)
+    step = compile_train_step(cfg, forward, state.master_params)
     loader = data_mod.build_dataloader(cfg.data, shard=False)
 
     import os, time, pickle
@@ -207,7 +216,7 @@ def train(cfg: TrainConfig) -> None:
             path = os.path.join(cfg.ckpt_dir, f"step_{s}.pkl")
             with open(path, "wb") as f:
                 payload = {
-                    "params": state.params,
+                    "master_params": state.master_params,
                     "opt_state": state.opt_state,
                     "step": s,
                 }

@@ -12,7 +12,7 @@ class GPTConfig:
     n_head: int = 12
     d_model: int = 768
     dropout_rate: float = 0.1
-    dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.bfloat16
 
 # ---------- (2) util funcs ------------
 def causal_mask(seq_len: int, dtype: Any = jnp.float32) -> jnp.ndarray:
@@ -20,18 +20,22 @@ def causal_mask(seq_len: int, dtype: Any = jnp.float32) -> jnp.ndarray:
     return jnp.where(jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, None, ...], jnp.array(0.0, dtype), jnp.array(-jnp.inf, dtype))
 
 def gelu(x: jnp.ndarray) -> jnp.ndarray:
-    half = jnp.asarray(0.5, dtype=x.dtype)
+    # GELU in input dtype (bf16-friendly)
+    half = jnp.asarray(0.5, x.dtype)
     return half * x * jax.lax.erfc(-x * jnp.sqrt(half))
 
 def dropout(x: jnp.ndarray, rate: float, key: jax.Array, *, train: bool) -> jnp.ndarray:
     if (rate == 0.0) or (not train): return x
-    keep_prob = jnp.asarray(1.0 - rate, dtype=x.dtype)
+    keep_prob = jnp.asarray(1.0 - rate, x.dtype)
     return (jax.random.bernoulli(key, keep_prob, x.shape)).astype(x.dtype) * x / keep_prob
 
 def layernorm(x: jnp.ndarray, gamma: jnp.ndarray, beta: jnp.ndarray, eps: float = 1e-5) -> jnp.ndarray:
-    # layernorm over last dim: y = (x_centered / sqrt(var + eps)) * gamma + beta
-    x_centered = x - jnp.mean(x, axis=-1, keepdims=True)
-    return (x_centered * jax.lax.rsqrt(jnp.mean(jnp.square(x_centered), axis=-1, keepdims=True) + jnp.asarray(eps, dtype=x.dtype))) * gamma.astype(x.dtype) + beta.astype(x.dtype)
+    # layernorm over last dim: statistics and affine in f32, single cast at end
+    x_f32 = x.astype(jnp.float32)
+    centered = x_f32 - jnp.mean(x_f32, axis=-1, keepdims=True)
+    inv_std = jax.lax.rsqrt(jnp.mean(jnp.square(centered), axis=-1, keepdims=True) + jnp.asarray(eps, jnp.float32))
+    y_f32 = centered * inv_std
+    return (y_f32 * gamma + beta).astype(x.dtype)
 
 # ---------- (3) parameter pytrees ------------
 class LayerNormParams(NamedTuple):
@@ -67,7 +71,7 @@ class ModelParams(NamedTuple):
 def init_block_params(key: jax.Array, cfg: GPTConfig) -> BlockParams:
     # a block: attn + mlp + two pre-LNs
     def n(k: jax.Array, s: Tuple[int, ...]) -> jnp.ndarray:
-        return jax.random.normal(k, s, cfg.dtype) / jnp.sqrt(jnp.array(s[0], cfg.dtype))
+        return jax.random.normal(k, s, cfg.dtype) / jnp.sqrt(jnp.array(s[0], jnp.float32))
     k1, k2, k3, k4 = jax.random.split(key, 4)
     C = cfg.d_model  # c for channel
     # mats: qkv (C,3C), o (C,C), mlp (C,4C),(4C,C); biases = 0
@@ -75,7 +79,7 @@ def init_block_params(key: jax.Array, cfg: GPTConfig) -> BlockParams:
     W_o   = n(k2, (C, C));     b_o   = jnp.zeros((C,), cfg.dtype)
     W1    = n(k3, (C, 4 * C)); b1    = jnp.zeros((4 * C,), cfg.dtype)
     W2    = n(k4, (4 * C, C)); b2    = jnp.zeros((C,), cfg.dtype)
-    ln = lambda: LayerNormParams(gamma=jnp.ones((C,), cfg.dtype), beta=jnp.zeros((C,), cfg.dtype))  # pre-LN: gamma=1, beta=0
+    ln = lambda: LayerNormParams(gamma=jnp.ones((C,), jnp.float32), beta=jnp.zeros((C,), jnp.float32))  # pre-LN: gamma=1, beta=0
     return BlockParams(ln1=ln(), attn=AttnParams(W_qkv=W_qkv, b_qkv=b_qkv, W_o=W_o, b_o=b_o), ln2=ln(), mlp=MlpParams(W1=W1, b1=b1, W2=W2, b2=b2))
 
 def init_gpt_params(cfg: GPTConfig, key: jax.Array) -> ModelParams:
@@ -86,7 +90,7 @@ def init_gpt_params(cfg: GPTConfig, key: jax.Array) -> ModelParams:
         tok_embed = 0.02 * jax.random.normal(k_tok, (V, C), cfg.dtype),  # small N(0,1) init like GPT-2
         pos_embed = 0.02 * jax.random.normal(k_pos, (T, C), cfg.dtype),  # learned absolute positions
         blocks = tuple(init_block_params(k, cfg) for k in jax.random.split(k_blocks, cfg.n_layer)),  # per-layer params
-        ln_f = LayerNormParams(gamma=jnp.ones((C,), cfg.dtype), beta=jnp.zeros((C,), cfg.dtype)),  # pre-LN
+        ln_f = LayerNormParams(gamma=jnp.ones((C,), jnp.float32), beta=jnp.zeros((C,), jnp.float32)),  # final LN in f32
         head_b = jnp.zeros((V,), cfg.dtype),  # output bias (tied weights via tok_embed in forward)
     )
 
@@ -96,13 +100,13 @@ def self_attention(x: jnp.ndarray, params: AttnParams, cfg: GPTConfig, key: jax.
     # project x -> [q|k|v] in one matmul, pack as (B,T,H,3D), then split along last dim
     qkv = (jnp.einsum("btc,cf->btf", x, params.W_qkv) + params.b_qkv).reshape(B, T, H, 3 * D)  # (B,T,C) x (C,3C) -> (B,T,3C); f = concatenated qkv (size 3C)
     q, k, v = jnp.split(qkv, 3, axis=-1)
-    # sdp attention (1/sqrt(D)) + causal mask
-    att = jnp.einsum("bthd,bThd->bhtT", q, k) * jax.lax.rsqrt(jnp.array(D, dtype=x.dtype)) + mask  # (B,T,H,D) x (B,T,H,D) -> (B,H,T,T); sum over d
-    # softmax on vectors (attention probs) -> dropout -> p
+    # sdp attention (1/sqrt(D)) + causal mask; compute in f32 for stability
+    scale = jax.lax.rsqrt(jnp.asarray(D, jnp.float32))
+    attn_logits = jnp.einsum("bthd,bThd->bhtT", q.astype(jnp.float32), k.astype(jnp.float32)) * scale + mask
     k1, k2 = jax.random.split(key)
-    p = dropout(jax.nn.softmax(att, axis=-1), cfg.dropout_rate, k1, train=train)
+    probs = dropout(jax.nn.softmax(attn_logits, axis=-1).astype(x.dtype), cfg.dropout_rate, k1, train=train)
     # weighted sum of values -> merge heads -> output proj -> dropout
-    y = jnp.einsum("bhtT,bThd->bthd", p, v).reshape(B, T, C)  # (B,H,T,T) x (B,T,H,D) -> (B,T,H,D); sum over T
+    y = jnp.einsum("bhtT,bThd->bthd", probs, v).reshape(B, T, C)  # (B,H,T,T) x (B,T,H,D) -> (B,T,H,D); sum over T
     y = jnp.einsum("btc,co->bto", y, params.W_o) + params.b_o  # (B,T,C) x (C,C) -> (B,T,C); o = output features (size C)
     return dropout(y, cfg.dropout_rate, k2, train=train)
 
@@ -133,8 +137,8 @@ def gpt_forward(
     k_e, k_l = jax.random.split(key, 2)  # RNGs for embed / layers
     x = params.tok_embed[idx] + (params.pos_embed[:T] if pos_ids is None else params.pos_embed[pos_ids])  # (B,T,C)
     x = dropout(x, cfg.dropout_rate, k_e, train=train)  # embed dropout
-    m = causal_mask(T, dtype=x.dtype)
-    if attn_bias is not None: m = m + attn_bias.astype(x.dtype)  # additive bias (currently optional)
+    m = causal_mask(T, dtype=jnp.float32)
+    if attn_bias is not None: m = m + attn_bias.astype(jnp.float32)  # additive bias (currently optional)
     # scan step: takes carry (x_c, k_c) and BlockParams p; splits RNG, applies one transformer block with mask m and train flag; returns updated carry (x_next, k_next) and None
     def step(c, p): x_c, k_c = c; k_c, k_s = jax.random.split(k_c); return (transformer(x_c, p, cfg, k_s, m, train), k_c), None  # one block
     stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves, axis=0), *params.blocks)  # stack layer params
