@@ -20,7 +20,6 @@ def causal_mask(seq_len: int, dtype: Any = jnp.float32) -> jnp.ndarray:
     return jnp.where(jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, None, ...], jnp.array(0.0, dtype), jnp.array(-jnp.inf, dtype))
 
 def gelu(x: jnp.ndarray) -> jnp.ndarray:
-    # GELU in input dtype (bf16-friendly)
     half = jnp.asarray(0.5, x.dtype)
     return half * x * jax.lax.erfc(-x * jnp.sqrt(half))
 
@@ -108,13 +107,14 @@ def self_attention(x: jnp.ndarray, params: AttnParams, cfg: GPTConfig, key: jax.
     # weighted sum of values -> merge heads -> output proj -> dropout
     y = jnp.einsum("bhtT,bThd->bthd", probs, v).reshape(B, T, C)  # (B,H,T,T) x (B,T,H,D) -> (B,T,H,D); sum over T
     y = jnp.einsum("btc,co->bto", y, params.W_o) + params.b_o  # (B,T,C) x (C,C) -> (B,T,C); o = output features (size C)
-    return dropout(y, cfg.dropout_rate, k2, train=train)
+    return dropout(y, cfg.dropout_rate, k2, train=train).astype(x.dtype)
 
 def mlp(x: jnp.ndarray, params: MlpParams, cfg: GPTConfig, key: jax.Array, train: bool) -> jnp.ndarray:
     k1, k2 = jax.random.split(key)
     # affine -> gelu -> dropout -> affine -> residual dropout
     h = dropout(gelu(jnp.einsum("btc,cm->btm", x, params.W1) + params.b1), cfg.dropout_rate, k1, train=train)  # (B,T,C) x (C,4C) -> (B,T,4C); c = model channel (C), m = mlp hidden (4C)
-    return dropout(jnp.einsum("btm,mc->btc", h, params.W2) + params.b2, cfg.dropout_rate, k2, train=train)  # (B,T,4C) x (4C,C) -> (B,T,C); m = mlp hidden (4C), c = model channel (C)
+    y = jnp.einsum("btm,mc->btc", h, params.W2) + params.b2  # (B,T,4C) x (4C,C) -> (B,T,C); m = mlp hidden (4C), c = model channel (C)
+    return dropout(y, cfg.dropout_rate, k2, train=train).astype(x.dtype)
 
 def transformer(x: jnp.ndarray, params: BlockParams, cfg: GPTConfig, key: jax.Array, mask: jnp.ndarray, train: bool) -> jnp.ndarray:
     k1, k2 = jax.random.split(key)
