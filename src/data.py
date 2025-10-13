@@ -68,7 +68,10 @@ def _batch_iterator(cfg: DataConfig) -> Iterator[Tuple[jnp.ndarray, jnp.ndarray]
     while True:
         flat = [next(stream) for _ in range(need)]
         arr = jnp.asarray(flat, dtype=jnp.int32).reshape(B, T + 1)
-        yield arr[:, :T], arr[:, 1:]
+        # to avoids double-donation errors when using donate_argnums in JIT.
+        xs = arr[:, :T].copy()
+        ys = arr[:, 1:].copy()
+        yield xs, ys
 
 def _prefetch(it: Iterator[Tuple[jnp.ndarray, jnp.ndarray]], size: int) -> Iterator[Tuple[jnp.ndarray, jnp.ndarray]]:
     import threading, queue

@@ -116,7 +116,7 @@ def compile_train_step(
     opt = make_optim(cfg, master_params_example)
     grad_fn = jax.grad(lambda p, x, y, k: loss_fn(p, x, y, forward, k))
 
-    @partial(jax.jit, donate_argnums=(0, 1))
+    @jax.jit
     def step(state: TrainState, batch: Tuple[jnp.ndarray, jnp.ndarray]):
         xs, ys = batch
         gs = cfg.grad_accum_steps
