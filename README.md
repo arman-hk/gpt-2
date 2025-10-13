@@ -16,6 +16,6 @@ That's basically it.
 - Education: did this project to better understand `jax` programming, implement gpt-2 from scratch, and code as clear and compact as possible so others can also see this as an educational resource.
 
 ### WIP:
-- [ ] train with TPUs
+- [ ] train with TPU
 - [ ] optimize and experiment
 - [ ] have fun and see where this goes

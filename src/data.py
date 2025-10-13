@@ -23,10 +23,7 @@ def _load_tokenizer(name: str, add_bos: bool, add_eos: bool):
         if tok.eos_token is None:
             tok.add_special_tokens({"eos_token": ""})
         tok.pad_token = tok.eos_token
-    try:
-        tok.model_max_length = 10_000_000  # to avoid error, since we handle packing
-    except Exception:
-        pass
+    tok.model_max_length = int(1e9)  # avoid truncation warnings; we handle packing
     bos_id = tok.bos_token_id if add_bos else None
     eos_id = tok.eos_token_id if add_eos else None
     return tok, bos_id, eos_id
@@ -49,7 +46,12 @@ def _token_id_stream(cfg: DataConfig) -> Iterator[int]:
         mb.append(txt)
         if len(mb) < mb_size:
             continue
-        enc = tok(mb, add_special_tokens=False, return_attention_mask=False)["input_ids"]
+        enc = tok(
+            mb,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            truncation=False,
+        )["input_ids"]
         mb.clear()
         for ids in enc:
             if bos_id is not None:
