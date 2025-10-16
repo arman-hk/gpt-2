@@ -2,9 +2,7 @@ import dataclasses
 from itertools import islice
 from typing import Iterator, Optional, Tuple
 import threading, queue
-import jax
-import jax.numpy as jnp
-import numpy as np
+import jax, jax.numpy as jnp, numpy as np
 
 Batch = Tuple[jnp.ndarray, jnp.ndarray]
 
@@ -22,13 +20,6 @@ class DataConfig:
     prefetch_size: int = 4
     tokenizer_batch_size: int = 64
 
-def _load_tokenizer(cfg: DataConfig):
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(cfg.tokenizer_name, use_fast=True)
-    if tok.pad_token is None: tok.add_special_tokens({"pad_token": tok.eos_token or tok.bos_token or "<|pad|>"})
-    tok.model_max_length = int(1e9)
-    return tok, tok.bos_token_id if cfg.add_bos_token else None, tok.eos_token_id if cfg.add_eos_token else None
-
 def _text_batches(cfg: DataConfig) -> Iterator[list[str]]:
     from datasets import load_dataset
     while True:
@@ -36,7 +27,11 @@ def _text_batches(cfg: DataConfig) -> Iterator[list[str]]:
         yield from iter(lambda: list(islice(filter(None, (ex.get(cfg.text_column) for ex in ds.shuffle(seed=cfg.seed, buffer_size=cfg.shuffle_buffer_size))), cfg.tokenizer_batch_size)), [])
 
 def _token_stream(cfg: DataConfig) -> Iterator[int]:
-    tok, bos_id, eos_id = _load_tokenizer(cfg)
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(cfg.tokenizer_name, use_fast=True)
+    if tok.pad_token is None: tok.add_special_tokens({"pad_token": tok.eos_token or tok.bos_token or "<|pad|>"})
+    tok.model_max_length = int(1e9)
+    bos_id, eos_id = (tok.bos_token_id if cfg.add_bos_token else None, tok.eos_token_id if cfg.add_eos_token else None)
     for batch in _text_batches(cfg):
         for ids in tok(batch, add_special_tokens=False, return_attention_mask=False, truncation=False)["input_ids"]:
             if bos_id is not None: yield bos_id
