@@ -3,8 +3,8 @@ from typing import Any, Tuple, NamedTuple, Optional, Callable
 import jax
 import jax.numpy as jnp
 import optax
-from . import model, data as data_mod
 from functools import partial
+from . import model, data as data_mod
 
 from jax import config as jax_config
 jax_config.update("jax_default_matmul_precision", "highest")
@@ -65,22 +65,30 @@ def init_train_state(cfg: TrainConfig, key: jax.Array) -> Tuple[TrainState, Call
     return state, forward
 
 # ---------- (2) optim ------------
-def lr_schedule(s: jnp.ndarray, warmup: int, total: int, base: float) -> jnp.ndarray:
-    # linear warmup -> cosine decay to 0.1*base
-    w = base * s / jnp.maximum(1, warmup)
-    prog = jnp.clip((s - warmup) / jnp.maximum(1.0, total - warmup), 0.0, 1.0)
-    c = 0.1 * base + 0.45 * base * (1.0 + jnp.cos(jnp.pi * prog))
-    return jnp.where(s < warmup, w, c)
+def make_lr_schedule(cfg: TrainConfig):
+    decay_steps = max(1, int(cfg.total_steps) - int(cfg.warmup_steps))
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=float(cfg.base_lr),
+        warmup_steps=int(cfg.warmup_steps),
+        decay_steps=int(decay_steps),
+        end_value=float(0.1 * cfg.base_lr),
+    )
 
 def make_optim(cfg: TrainConfig, params: model.ModelParams) -> optax.GradientTransformation:
-    # AdamW: clip -> adam -> weight decay (masked) -> lr schedule -> descent
-    mask = jax.tree_util.tree_map(lambda x: x.ndim >= 2, params)  # apply decay only to matrices/embeddings
+    # AdamW with schedule; clip -> adamw (masked)
+    mask = jax.tree_util.tree_map(lambda x: x.ndim >= 2, params)
+    schedule = make_lr_schedule(cfg)
     return optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip_norm),
-        optax.scale_by_adam(b1=cfg.beta1, b2=cfg.beta2, eps=cfg.eps),
-        optax.add_decayed_weights(cfg.weight_decay, mask=mask),
-        optax.scale_by_schedule(lambda s: lr_schedule(s, cfg.warmup_steps, cfg.total_steps, cfg.base_lr)),
-        optax.scale(-1.0),
+        optax.adamw(
+            learning_rate=schedule,
+            b1=cfg.beta1,
+            b2=cfg.beta2,
+            eps=cfg.eps,
+            weight_decay=cfg.weight_decay,
+            mask=mask,
+        ),
     )
 
 # ---------- (3) loss and metrics ------------
@@ -127,10 +135,16 @@ def compile_train_step(
         xs_m = xs.reshape(gs, msz, xs.shape[1])
         ys_m = ys.reshape(gs, msz, ys.shape[1])
 
-        # vmap grad over microbatches, broadcast params
-        grads_m = jax.vmap(grad_fn, in_axes=(None, 0, 0, 0))(state.params, xs_m, ys_m, k_micro)
-        grads = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), grads_m)
-        grads_f32 = jax.tree_util.tree_map(lambda g: g.astype(jnp.float32), grads)
+        # accumulate grads sequentially over microbatches to reduce memory (vs vmap)
+        def body(acc, inputs):
+            x_mb, y_mb, k_mb = inputs
+            g = grad_fn(state.params, x_mb, y_mb, k_mb)
+            g = jax.tree_util.tree_map(lambda t: t.astype(jnp.float32), g)
+            return jax.tree_util.tree_map(lambda a, b: a + b, acc, g), None
+
+        init_acc = jax.tree_util.tree_map(jnp.zeros_like, state.master_params)
+        acc_grads, _ = jax.lax.scan(body, init_acc, (xs_m, ys_m, k_micro))
+        grads_f32 = jax.tree_util.tree_map(lambda g: g / gs, acc_grads)
 
         updates, new_opt_state = opt.update(grads_f32, state.opt_state, state.master_params)
         new_master_params = optax.apply_updates(state.master_params, updates)
@@ -152,6 +166,8 @@ def train(cfg: TrainConfig) -> None:
     key = jax.random.PRNGKey(cfg.seed)
     state, forward = init_train_state(cfg, key)
     step = compile_train_step(cfg, forward, state.master_params)
+    forward_eval = jax.jit(partial(forward, train=False))
+    schedule = make_lr_schedule(cfg)
     loader = data_mod.build_dataloader(cfg.data, shard=False)
 
     import os, time, pickle
@@ -185,20 +201,19 @@ def train(cfg: TrainConfig) -> None:
         except Exception as e:
             print(f"[wandb] disabled: {e}")
 
-    for _ in range(int(cfg.total_steps)):
+    for s in range(1, int(cfg.total_steps) + 1):
         batch = next(loader)
         state = step(state, batch)
-        s = int(state.step)
 
         if (s % cfg.log_every) == 0 or s == 1:
-            # report lr used for the previous update (s-1), matching opt schedule step
-            lr = float(lr_schedule(jnp.asarray(max(s - 1, 0), dtype=jnp.int32), cfg.warmup_steps, cfg.total_steps, cfg.base_lr))
+            # report lr used for the previous update (s-1), matching schedule step
+            lr = float(schedule(max(s - 1, 0)))
             dt = time.time() - t0
             steps_done = 1 if s == 1 else int(cfg.log_every)
             toks = steps_done * int(cfg.data.batch_size) * int(cfg.data.seq_len)
             tps = toks / max(dt, 1e-9)
             xs, ys = batch
-            logits = forward(state.params, xs, state.rng_key, train=False)
+            logits = forward_eval(state.params, xs, state.rng_key)
             m = compute_metrics(logits, ys)
             print(f"step {s:6d}  loss {float(m.loss):.4f}  acc {float(m.accuracy):.4f}  ppl {float(m.perplexity):.2f}  lr {lr:.6f}  {dt:.2f}s  {tps:.0f} tok/s")
             if wb is not None:
