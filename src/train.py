@@ -2,8 +2,7 @@ import dataclasses
 from typing import Any, Tuple, NamedTuple, Optional, Callable
 import jax, optax
 import jax.numpy as jnp
-from functools import partial; from . import model, data as data_mod
-from jax import config as jax_config; jax_config.update("jax_default_matmul_precision", "highest")
+from . import model, data as data_mod
 
 # ---------- (1) configs and train state ------------
 @dataclasses.dataclass
@@ -25,15 +24,15 @@ class TrainState(NamedTuple):
     params: model.ModelParams  # bf16 params used for forward/backprop
     master_params: model.ModelParams  # f32 master copy used by optimizer
     opt_state: Any
-    step: jnp.ndarray
     rng_key: jax.Array
 
-def init_train_state(cfg: TrainConfig, key: jax.Array) -> Tuple[TrainState, Callable[..., jnp.ndarray]]:
+def init_train_state(cfg: TrainConfig, key: jax.Array) -> Tuple[TrainState, Callable[..., jnp.ndarray], Any, Callable[[int], float]]:
     k_init, k_state = jax.random.split(key, 2)
     params, forward = model.build(cfg.gpt, key=k_init)
     master_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), params)
-    opt = make_optim(cfg, master_params)
-    return TrainState(params, master_params, opt.init(master_params), jnp.asarray(0, jnp.int32), k_state), forward
+    schedule = make_lr_schedule(cfg)
+    opt = make_optim(cfg, master_params, schedule)
+    return TrainState(params, master_params, opt.init(master_params), k_state), forward, opt, schedule
 
 # ---------- (2) optim ------------
 def make_lr_schedule(cfg: TrainConfig):
@@ -46,11 +45,10 @@ def make_lr_schedule(cfg: TrainConfig):
         end_value=float(0.1 * cfg.base_lr),
     )
 
-def make_optim(cfg: TrainConfig, params: model.ModelParams) -> optax.GradientTransformation:
-    # AdamW with schedule; clip -> AdamW (masked)
+def make_optim(cfg: TrainConfig, params: model.ModelParams, schedule: Callable[[int], float]) -> Any:
+    # AdamW with schedule; clip -> AdamW (masked); wrapped with MultiSteps
     mask = jax.tree_util.tree_map(lambda x: x.ndim >= 2, params)
-    schedule = make_lr_schedule(cfg)
-    return optax.chain(
+    inner = optax.chain(
         optax.clip_by_global_norm(cfg.grad_clip_norm),
         optax.adamw(
             learning_rate=schedule,
@@ -61,58 +59,41 @@ def make_optim(cfg: TrainConfig, params: model.ModelParams) -> optax.GradientTra
             mask=mask,
         ),
     )
+    return optax.MultiSteps(inner, every_k_schedule=int(cfg.grad_accum_steps))
 
 # ---------- (3) loss and metrics ------------
 def xent_loss(logits: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
     return -jnp.mean(jnp.take_along_axis(jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1), targets[..., None], axis=-1).squeeze(-1))
 
-class Metrics(NamedTuple): loss: jnp.ndarray; accuracy: jnp.ndarray; perplexity: jnp.ndarray
+class Metrics(NamedTuple): loss: jnp.ndarray; perplexity: jnp.ndarray
 
 def compute_metrics(logits: jnp.ndarray, targets: jnp.ndarray) -> Metrics:
     loss = xent_loss(logits, targets)
-    acc = jnp.mean((jnp.argmax(logits, axis=-1) == targets).astype(jnp.float32))
-    return Metrics(loss=loss, accuracy=acc, perplexity=jnp.exp(loss))
+    return Metrics(loss=loss, perplexity=jnp.exp(loss))
 
 def loss_fn(params: model.ModelParams, xs: jnp.ndarray, ys: jnp.ndarray, forward: Callable, key: jax.Array) -> jnp.ndarray:
     return xent_loss(forward(params, xs, key, train=True), ys)
 
 # ---------- (4) single-device train step ------------
-def compile_train_step(cfg: TrainConfig, forward: Callable[..., jnp.ndarray], master_params_example: model.ModelParams):
-    opt = make_optim(cfg, master_params_example)
+def compile_train_step(cfg: TrainConfig, forward: Callable[..., jnp.ndarray], opt: Any):
     grad_fn = jax.grad(lambda p, x, y, k: loss_fn(p, x, y, forward, k))
     @jax.jit
     def step(state: TrainState, batch: Tuple[jnp.ndarray, jnp.ndarray]):
         xs, ys = batch
-        gs = cfg.grad_accum_steps
-        B, msz = xs.shape[0], xs.shape[0] // gs; assert (B % gs) == 0
-        keys = jax.random.split(state.rng_key, gs + 1)
-        k_micro, k_next = keys[:-1], keys[-1]
-        xs_m, ys_m = xs.reshape(gs, msz, xs.shape[1]), ys.reshape(gs, msz, ys.shape[1])
-        
-        # accumulate grads sequentially over microbatches to reduce memory (vs vmap)
-        def body(acc, inputs):
-            x_mb, y_mb, k_mb = inputs
-            g = grad_fn(state.params, x_mb, y_mb, k_mb)
-            g = jax.tree_util.tree_map(lambda t: t.astype(jnp.float32), g)
-            return jax.tree_util.tree_map(lambda a, b: a + b, acc, g), None
-
-        init_acc = jax.tree_util.tree_map(jnp.zeros_like, state.master_params)
-        acc_grads, _ = jax.lax.scan(body, init_acc, (xs_m, ys_m, k_micro))
-        grads_f32 = jax.tree_util.tree_map(lambda g: g / gs, acc_grads)
-        
+        k_use, k_next = jax.random.split(state.rng_key, 2)
+        grads = grad_fn(state.params, xs, ys, k_use)
+        grads_f32 = jax.tree_util.tree_map(lambda t: t.astype(jnp.float32), grads)
         updates, new_opt_state = opt.update(grads_f32, state.opt_state, state.master_params)
         new_master_params = optax.apply_updates(state.master_params, updates)
         new_params = jax.tree_util.tree_map(lambda old, new: new.astype(old.dtype), state.params, new_master_params)
-        return TrainState(params=new_params, master_params=new_master_params, opt_state=new_opt_state, step=state.step + 1, rng_key=k_next)
+        return TrainState(params=new_params, master_params=new_master_params, opt_state=new_opt_state, rng_key=k_next)
     return step
 
 # ---------- (5) train loop ------------
 def train(cfg: TrainConfig) -> None:
     key = jax.random.PRNGKey(cfg.seed)
-    state, forward = init_train_state(cfg, key)
-    step = compile_train_step(cfg, forward, state.master_params)
-    forward_eval = jax.jit(partial(forward, train=False))
-    schedule = make_lr_schedule(cfg)
+    state, forward, opt, schedule = init_train_state(cfg, key)
+    step = compile_train_step(cfg, forward, opt)
     loader = data_mod.build_dataloader(cfg.data, shard=False)
     
     import os, time, pickle
@@ -146,21 +127,31 @@ def train(cfg: TrainConfig) -> None:
 
     for s in range(1, int(cfg.total_steps) + 1):
         batch = next(loader)
-        state = step(state, batch)
+        # Accumulate via MultiSteps; if grad_accum_steps > 1 and batch is a "packed" batch,
+        # split in host and call step multiple times.
+        xs, ys = batch
+        gs = int(cfg.grad_accum_steps)
+        if gs > 1 and (xs.shape[0] % gs) == 0:
+            msz = xs.shape[0] // gs
+            for i in range(gs):
+                state = step(state, (xs[i*msz:(i+1)*msz], ys[i*msz:(i+1)*msz]))
+        else:
+            state = step(state, batch)
         if (s % cfg.log_every) == 0 or s == 1:
-            lr = float(schedule(max(s - 1, 0)))
+            # Derive LR used for the just-applied update: schedule(gradient_step - 1)
+            gstep = int(jax.device_get(state.opt_state.gradient_step))
+            lr = float(schedule(max(gstep - 1, 0)))
             dt = time.time() - t0
             steps_done = 1 if s == 1 else int(cfg.log_every)
             toks = steps_done * int(cfg.data.batch_size) * int(cfg.data.seq_len)
             tps = toks / max(dt, 1e-9)
             xs, ys = batch
-            logits = forward_eval(state.params, xs, state.rng_key)
+            logits = forward(state.params, xs, state.rng_key, train=False)
             m = compute_metrics(logits, ys)
-            print(f"step {s:6d}  loss {float(m.loss):.4f}  acc {float(m.accuracy):.4f}  ppl {float(m.perplexity):.2f}  lr {lr:.6f}  {dt:.2f}s  {tps:.0f} tok/s")
+            print(f"step {s:6d}  loss {float(m.loss):.4f}  ppl {float(m.perplexity):.2f}  lr {lr:.6f}  {dt:.2f}s  {tps:.0f} tok/s")
             if wb is not None:
                 wb.log({
                     "train/loss": float(m.loss),
-                    "train/accuracy": float(m.accuracy),
                     "train/perplexity": float(m.perplexity),
                     "train/lr": lr,
                     "throughput/tokens_per_sec": tps,
