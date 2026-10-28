@@ -1,10 +1,32 @@
+# Python environments and generated files
 __pycache__/
 *.py[cod]
 .venv/
-.env
-wandb
-*.log
-.DS_Store
-.cursor
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 .ipynb_checkpoints/
-*/.ipynb_checkpoints/*
+
+# Local editor and OS files
+.vscode/
+.idea/
+.cursor/
+.DS_Store
+*.swp
+*.swo
+
+# Local environment files; keep shareable templates visible
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Training outputs and logs
+wandb/
+/ckpts/
+/checkpoints/
+*.log

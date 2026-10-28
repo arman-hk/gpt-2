@@ -2,7 +2,8 @@ import dataclasses
 from typing import Any, Tuple, NamedTuple, Optional, Callable
 import jax, optax
 import jax.numpy as jnp
-from . import model, data as data_mod
+from . import model
+from .data import DataConfig, build_dataloader
 
 # ---------- (1) configs and train state ------------
 @dataclasses.dataclass
@@ -18,7 +19,7 @@ class TrainConfig:
     wandb_project: str = "gpt-speedrun"; wandb_run_name: Optional[str] = None
     # other configs
     gpt: model.GPTConfig = dataclasses.field(default_factory=lambda: model.GPTConfig(vocab_size=50257, ctx_len=128, n_layer=2, n_head=2, d_model=64, dropout_rate=0.0, dtype=jnp.bfloat16))
-    data: data_mod.DataConfig = dataclasses.field(default_factory=lambda: data_mod.DataConfig(batch_size=8, seq_len=128))
+    data: DataConfig = dataclasses.field(default_factory=lambda: DataConfig(batch_size=8, seq_len=128))
 
 class TrainState(NamedTuple):
     params: model.ModelParams  # bf16 params used for forward/backprop
@@ -94,7 +95,7 @@ def train(cfg: TrainConfig) -> None:
     key = jax.random.PRNGKey(cfg.seed)
     state, forward, opt, schedule = init_train_state(cfg, key)
     step = compile_train_step(cfg, forward, opt)
-    loader = data_mod.build_dataloader(cfg.data, shard=False)
+    loader = build_dataloader(cfg.data, shard=False)
     
     import os, time, pickle
     t0 = time.time()

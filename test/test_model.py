@@ -1,7 +1,7 @@
 import pytest
 import jax
 import jax.numpy as jnp
-import model
+from src import model
 
 @pytest.fixture
 def cfg_small():
