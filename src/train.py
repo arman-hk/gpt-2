@@ -1,5 +1,6 @@
 import dataclasses
 from contextlib import closing
+from numbers import Integral
 from typing import Any, Tuple, NamedTuple, Optional, Callable
 import jax, optax
 import jax.numpy as jnp
@@ -9,6 +10,7 @@ from .data import DataConfig, build_dataloader
 # ---------- (1) configs and train state ------------
 @dataclasses.dataclass
 class TrainConfig:
+    """steps count optimizer updates; data.batch_size includes all microbatches."""
     total_steps: int = 200; save_every: int = 100; log_every: int = 10; seed: int = 0
     # AdamW
     base_lr: float = 3e-4; weight_decay: float = 0.1; beta1: float = 0.9; beta2: float = 0.95; eps: float = 1e-8
@@ -22,6 +24,14 @@ class TrainConfig:
     gpt: model.GPTConfig = dataclasses.field(default_factory=lambda: model.GPTConfig(vocab_size=50257, ctx_len=128, n_layer=2, n_head=2, d_model=64, dropout_rate=0.0, dtype=jnp.bfloat16))
     data: DataConfig = dataclasses.field(default_factory=lambda: DataConfig(batch_size=8, seq_len=128))
 
+def _microbatch_size(cfg: TrainConfig) -> int:
+    for name, value in (("grad_accum_steps", cfg.grad_accum_steps), ("data.batch_size", cfg.data.batch_size)):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if cfg.data.batch_size % cfg.grad_accum_steps:
+        raise ValueError("data.batch_size must be divisible by grad_accum_steps")
+    return int(cfg.data.batch_size // cfg.grad_accum_steps)
+
 class TrainState(NamedTuple):
     params: model.ModelParams  # bf16 params used for forward/backprop
     master_params: model.ModelParams  # f32 master copy used by optimizer
@@ -29,6 +39,7 @@ class TrainState(NamedTuple):
     rng_key: jax.Array
 
 def init_train_state(cfg: TrainConfig, key: jax.Array) -> Tuple[TrainState, Callable[..., jnp.ndarray], Any, Callable[[int], float]]:
+    _microbatch_size(cfg)
     schedule = make_lr_schedule(cfg)
     k_init, k_state = jax.random.split(key, 2)
     params, forward = model.build(cfg.gpt, key=k_init)
@@ -82,6 +93,7 @@ def loss_fn(params: model.ModelParams, xs: jnp.ndarray, ys: jnp.ndarray, forward
 
 # ---------- (4) single-device train step ------------
 def compile_train_step(cfg: TrainConfig, forward: Callable[..., jnp.ndarray], opt: Any):
+    """compile one microbatch step; MultiSteps applies an update every K calls."""
     grad_fn = jax.grad(lambda p, x, y, k: loss_fn(p, x, y, forward, k))
     @jax.jit
     def step(state: TrainState, batch: Tuple[jnp.ndarray, jnp.ndarray]):
@@ -97,6 +109,7 @@ def compile_train_step(cfg: TrainConfig, forward: Callable[..., jnp.ndarray], op
 
 # ---------- (5) train loop ------------
 def train(cfg: TrainConfig) -> None:
+    msz = _microbatch_size(cfg)
     key = jax.random.PRNGKey(cfg.seed)
     state, forward, opt, schedule = init_train_state(cfg, key)
     step = compile_train_step(cfg, forward, opt)
@@ -134,15 +147,15 @@ def train(cfg: TrainConfig) -> None:
     with closing(loader):
         for s in range(1, int(cfg.total_steps) + 1):
             batch = next(loader)
-            # accumulate via MultiSteps; if grad_accum_steps > 1 and batch is a "packed" batch, split in host and call step multiple times.
             xs, ys = batch
-            gs = int(cfg.grad_accum_steps)
-            if gs > 1 and (xs.shape[0] % gs) == 0:
-                msz = xs.shape[0] // gs
-                for i in range(gs):
-                    state = step(state, (xs[i*msz:(i+1)*msz], ys[i*msz:(i+1)*msz]))
-            else:
-                state = step(state, batch)
+            if xs.ndim != 2 or xs.shape != ys.shape or xs.shape[0] != cfg.data.batch_size:
+                raise ValueError(
+                    f"inputs and targets must have matching rank-2 shapes and batch size {cfg.data.batch_size}; "
+                    f"got {xs.shape} and {ys.shape}"
+                )
+            # average K equal microbatches and apply exactly one optimizer update.
+            for i in range(int(cfg.grad_accum_steps)):
+                state = step(state, (xs[i*msz:(i+1)*msz], ys[i*msz:(i+1)*msz]))
             if (s % cfg.log_every) == 0 or s == 1:
                 # derive LR used for the just-applied update: schedule(gradient_step - 1)
                 gstep = int(jax.device_get(state.opt_state.gradient_step))
