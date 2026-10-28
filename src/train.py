@@ -1,4 +1,5 @@
 import dataclasses
+from contextlib import closing
 from typing import Any, Tuple, NamedTuple, Optional, Callable
 import jax, optax
 import jax.numpy as jnp
@@ -46,7 +47,7 @@ def make_lr_schedule(cfg: TrainConfig):
         init_value=0.0,
         peak_value=float(cfg.base_lr),
         warmup_steps=warmup_steps,
-        decay_steps=total_steps,  # Optax includes warmup in the schedule duration.
+        decay_steps=total_steps,  # optax includes warmup in the schedule duration
         end_value=float(0.1 * cfg.base_lr),
     )
 
@@ -130,45 +131,45 @@ def train(cfg: TrainConfig) -> None:
         except Exception as e:
             print(f"[wandb] disabled: {e}")
 
-    for s in range(1, int(cfg.total_steps) + 1):
-        batch = next(loader)
-        # Accumulate via MultiSteps; if grad_accum_steps > 1 and batch is a "packed" batch,
-        # split in host and call step multiple times.
-        xs, ys = batch
-        gs = int(cfg.grad_accum_steps)
-        if gs > 1 and (xs.shape[0] % gs) == 0:
-            msz = xs.shape[0] // gs
-            for i in range(gs):
-                state = step(state, (xs[i*msz:(i+1)*msz], ys[i*msz:(i+1)*msz]))
-        else:
-            state = step(state, batch)
-        if (s % cfg.log_every) == 0 or s == 1:
-            # Derive LR used for the just-applied update: schedule(gradient_step - 1)
-            gstep = int(jax.device_get(state.opt_state.gradient_step))
-            lr = float(schedule(max(gstep - 1, 0)))
-            dt = time.time() - t0
-            steps_done = 1 if s == 1 else int(cfg.log_every)
-            toks = steps_done * int(cfg.data.batch_size) * int(cfg.data.seq_len)
-            tps = toks / max(dt, 1e-9)
+    with closing(loader):
+        for s in range(1, int(cfg.total_steps) + 1):
+            batch = next(loader)
+            # accumulate via MultiSteps; if grad_accum_steps > 1 and batch is a "packed" batch, split in host and call step multiple times.
             xs, ys = batch
-            logits = forward(state.params, xs, state.rng_key, train=False)
-            m = compute_metrics(logits, ys)
-            print(f"step {s:6d}  loss {float(m.loss):.4f}  ppl {float(m.perplexity):.2f}  lr {lr:.6f}  {dt:.2f}s  {tps:.0f} tok/s")
-            if wb is not None:
-                wb.log({
-                    "train/loss": float(m.loss),
-                    "train/perplexity": float(m.perplexity),
-                    "train/lr": lr,
-                    "throughput/tokens_per_sec": tps,
-                }, step=s)
-            t0 = time.time()
+            gs = int(cfg.grad_accum_steps)
+            if gs > 1 and (xs.shape[0] % gs) == 0:
+                msz = xs.shape[0] // gs
+                for i in range(gs):
+                    state = step(state, (xs[i*msz:(i+1)*msz], ys[i*msz:(i+1)*msz]))
+            else:
+                state = step(state, batch)
+            if (s % cfg.log_every) == 0 or s == 1:
+                # derive LR used for the just-applied update: schedule(gradient_step - 1)
+                gstep = int(jax.device_get(state.opt_state.gradient_step))
+                lr = float(schedule(max(gstep - 1, 0)))
+                dt = time.time() - t0
+                steps_done = 1 if s == 1 else int(cfg.log_every)
+                toks = steps_done * int(cfg.data.batch_size) * int(cfg.data.seq_len)
+                tps = toks / max(dt, 1e-9)
+                xs, ys = batch
+                logits = forward(state.params, xs, state.rng_key, train=False)
+                m = compute_metrics(logits, ys)
+                print(f"step {s:6d}  loss {float(m.loss):.4f}  ppl {float(m.perplexity):.2f}  lr {lr:.6f}  {dt:.2f}s  {tps:.0f} tok/s")
+                if wb is not None:
+                    wb.log({
+                        "train/loss": float(m.loss),
+                        "train/perplexity": float(m.perplexity),
+                        "train/lr": lr,
+                        "throughput/tokens_per_sec": tps,
+                    }, step=s)
+                t0 = time.time()
 
-        if cfg.save_checkpoints and (cfg.save_every > 0) and ((s % cfg.save_every) == 0):
-            os.makedirs(cfg.ckpt_dir, exist_ok=True)
-            path = os.path.join(cfg.ckpt_dir, f"step_{s}.pkl")
-            with open(path, "wb") as f:
-                payload = {"master_params": state.master_params, "opt_state": state.opt_state, "step": s}
-                pickle.dump(jax.device_get(payload), f)
+            if cfg.save_checkpoints and (cfg.save_every > 0) and ((s % cfg.save_every) == 0):
+                os.makedirs(cfg.ckpt_dir, exist_ok=True)
+                path = os.path.join(cfg.ckpt_dir, f"step_{s}.pkl")
+                with open(path, "wb") as f:
+                    payload = {"master_params": state.master_params, "opt_state": state.opt_state, "step": s}
+                    pickle.dump(jax.device_get(payload), f)
     if wb is not None:
         try: wb.finish()
         except Exception: pass

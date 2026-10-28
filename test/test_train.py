@@ -1,4 +1,5 @@
 import pickle
+import threading
 
 import jax
 import jax.numpy as jnp
@@ -66,18 +67,24 @@ def test_train_on_local_batches(monkeypatch, tmp_path, dtype):
             vocab_size=16, ctx_len=4, n_layer=1, n_head=2,
             d_model=8, dropout_rate=0.0, dtype=dtype,
         ),
-        data=data.DataConfig(batch_size=2, seq_len=4, prefetch_size=0),
+        data=data.DataConfig(batch_size=2, seq_len=4, prefetch_size=1),
     )
-    xs = jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32)
+    xs = jnp.array([[0, 1, 2, 3], [5, 6, 7, 8]], dtype=jnp.int32)
     ys = xs + 1
-    monkeypatch.setattr(
-        train, "build_dataloader",
-        lambda config, *, shard: iter([(xs, ys)] * cfg.total_steps),
-    )
+    closed = threading.Event()
+
+    def tokens(config):
+        try:
+            while True: yield from range(10)
+        finally:
+            closed.set()
+
+    monkeypatch.setattr(data, "_token_stream", tokens)
     initial, forward, _, _ = train.init_train_state(cfg, jax.random.PRNGKey(cfg.seed))
     initial_loss = train.xent_loss(forward(initial.params, xs, initial.rng_key), ys)
 
     train.train(cfg)
+    assert closed.is_set()
 
     with (tmp_path / "step_4.pkl").open("rb") as f:
         checkpoint = pickle.load(f)
@@ -90,3 +97,25 @@ def test_train_on_local_batches(monkeypatch, tmp_path, dtype):
     final_loss = train.xent_loss(forward(params, xs, initial.rng_key), ys)
     assert bool(jnp.isfinite(final_loss))
     assert float(final_loss) < float(initial_loss)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("update failed"), KeyboardInterrupt()])
+def test_train_closes_loader_if_update_fails(monkeypatch, error):
+    closed = threading.Event()
+
+    def tokens(config):
+        try:
+            while True: yield from range(4)
+        finally:
+            closed.set()
+
+    def fail_update(*args): raise error
+
+    monkeypatch.setattr(data, "_token_stream", tokens)
+    monkeypatch.setattr(train, "init_train_state", lambda *args: (None, None, None, None))
+    monkeypatch.setattr(train, "compile_train_step", lambda *args: fail_update)
+    cfg = train.TrainConfig(use_wandb=False, data=data.DataConfig(batch_size=1, seq_len=3, prefetch_size=1))
+    with pytest.raises(type(error)) as raised:
+        train.train(cfg)
+    assert raised.value is error
+    assert closed.is_set()
