@@ -13,6 +13,44 @@ def test_train_config_has_independent_data_defaults():
     assert first.data is not second.data
 
 
+def test_lr_schedule_default_boundaries():
+    cfg = train.TrainConfig()
+    schedule = jax.jit(jax.vmap(train.make_lr_schedule(cfg)))
+    rates = schedule(jnp.array([0, 25, 50, 125, 150, 200, 250]))
+    assert rates.tolist() == pytest.approx(
+        [cfg.base_lr * scale for scale in [0.0, 0.5, 1.0, 0.55, 0.325, 0.1, 0.1]],
+    )
+
+
+@pytest.mark.parametrize("total_steps,warmup_steps", [(100, 50), (3, 2), (20, 0), (1, 0)])
+def test_lr_schedule_short_runs_and_no_warmup(total_steps, warmup_steps):
+    cfg = train.TrainConfig(total_steps=total_steps, warmup_steps=warmup_steps)
+    schedule = train.make_lr_schedule(cfg)
+    end_lr = 0.1 * cfg.base_lr
+    assert float(schedule(0)) == pytest.approx(0.0 if warmup_steps else cfg.base_lr)
+    assert float(schedule(warmup_steps)) == pytest.approx(cfg.base_lr)
+    assert float(schedule(total_steps - 1)) > end_lr
+    assert float(schedule(total_steps)) == pytest.approx(end_lr)
+    assert float(schedule(total_steps + 10)) == pytest.approx(end_lr)
+    rates = jax.vmap(schedule)(jnp.arange(total_steps + 1))
+    assert bool(jnp.isfinite(rates).all())
+    assert bool((jnp.diff(rates[:warmup_steps + 1]) >= 0).all())
+    assert bool((jnp.diff(rates[warmup_steps:]) <= 0).all())
+
+
+@pytest.mark.parametrize("total_steps,warmup_steps,message", [
+    (0, 0, "total_steps must be positive"),
+    (-1, 0, "total_steps must be positive"),
+    (10, -1, "warmup_steps must satisfy"),
+    (50, 50, "warmup_steps must satisfy"),
+    (10, 11, "warmup_steps must satisfy"),
+])
+def test_lr_schedule_rejects_invalid_durations(total_steps, warmup_steps, message):
+    cfg = train.TrainConfig(total_steps=total_steps, warmup_steps=warmup_steps)
+    with pytest.raises(ValueError, match=message):
+        train.make_lr_schedule(cfg)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_train_on_local_batches(monkeypatch, tmp_path, dtype):
     cfg = train.TrainConfig(

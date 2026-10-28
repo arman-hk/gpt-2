@@ -28,21 +28,25 @@ class TrainState(NamedTuple):
     rng_key: jax.Array
 
 def init_train_state(cfg: TrainConfig, key: jax.Array) -> Tuple[TrainState, Callable[..., jnp.ndarray], Any, Callable[[int], float]]:
+    schedule = make_lr_schedule(cfg)
     k_init, k_state = jax.random.split(key, 2)
     params, forward = model.build(cfg.gpt, key=k_init)
     master_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), params)
-    schedule = make_lr_schedule(cfg)
     opt = make_optim(cfg, master_params, schedule)
     return TrainState(params, master_params, opt.init(master_params), k_state), forward, opt, schedule
 
 # ---------- (2) optim ------------
 def make_lr_schedule(cfg: TrainConfig):
-    decay_steps = max(1, int(cfg.total_steps) - int(cfg.warmup_steps))
+    total_steps, warmup_steps = int(cfg.total_steps), int(cfg.warmup_steps)
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    if not 0 <= warmup_steps < total_steps:
+        raise ValueError("warmup_steps must satisfy 0 <= warmup_steps < total_steps")
     return optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=float(cfg.base_lr),
-        warmup_steps=int(cfg.warmup_steps),
-        decay_steps=int(decay_steps),
+        warmup_steps=warmup_steps,
+        decay_steps=total_steps,  # Optax includes warmup in the schedule duration.
         end_value=float(0.1 * cfg.base_lr),
     )
 
